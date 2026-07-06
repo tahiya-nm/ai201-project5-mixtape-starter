@@ -143,6 +143,61 @@ events, including both the 2-hour-old and 10-minute-old ones), proving the
 `RECENT_THRESHOLD` change is isolated to `get_friends_listening_now()` and
 doesn't affect the unrelated activity feed function.
 
+### Issue #3: The same song keeps showing up twice in search
+
+**How I reproduced it:** Initially searched for a known 3-tag song
+("Crown Heights Anthem") via `GET /songs/search?q=Crown` and got back
+`count: 1` — no duplicate, contradicting my initial expectation. Ran the
+project's own test suite (`pytest tests/test_search.py -v`) and all 5 tests
+passed, including one whose own comment reads
+`# Should be 1, bug causes it to be 3`. This told me the bug existed by
+design but wasn't manifesting in my environment, so I needed to trace deeper
+rather than trust a single black-box test.
+
+**How I found the root cause:** Wrote a standalone script to run the exact
+query from `search_songs()` directly and print `len(results)` — it returned
+1, matching the earlier observation. To rule out ORM-level masking, I then
+executed the query's raw compiled SQL directly via `db.session.execute()`
+instead of going through the legacy `Query.all()` interface. That returned
+**3** identical rows for the same song. This showed the join genuinely
+produces 3 duplicate rows in the database result (one per row in
+`song_tags`, since "Crown Heights Anthem" has 3 tags), but `db.session
+.query(Song)....all()` was silently deduplicating those 3 identical
+entities down to 1 before ever reaching `to_dict()`. Checked `pip show
+sqlalchemy` (2.0.51 installed) against `requirements.txt`
+(`sqlalchemy>=2.0.0`, an open floor with no ceiling) — confirming the
+project's version constraint doesn't pin the exact point release the bug was
+originally authored and tested against, and my installed version happens to
+auto-deduplicate `Query.all()` results in a way an earlier one apparently
+didn't.
+
+**The root cause:** `search_songs()` performs
+`.outerjoin(song_tags, Song.id == song_tags.c.song_id)` but never filters or
+selects on anything from that table — tags are loaded separately via the
+`Song.tags` relationship inside `to_dict()`. The join serves no functional
+purpose in this query, and joining against a many-to-many association table
+without a `.distinct()` guard is a classic source of duplicate rows: a song
+with N tags produces N rows in the join result, one per tag. The underlying
+SQL genuinely returns duplicate rows (confirmed directly), it's only masked
+in this environment by SQLAlchemy 2.0.51's entity-loading behavior in the
+legacy `Query` interface — behavior that isn't guaranteed across versions
+and that the project's own test comment shows the bug's author didn't expect.
+Relying on an un-pinned dependency's incidental behavior to hide a defect in
+the query itself is not a safe fix — the defect (an unnecessary,
+un-deduplicated join) was real regardless of whether it happened to be
+visible in every environment.
+
+**My fix and side-effect check:** Removed the `.outerjoin(song_tags, ...)`
+clause entirely from `search_songs()`, since it was never used for filtering
+or selection. Verified via the compiled SQL that the fixed query contains no
+`JOIN` at all and returns exactly 1 raw row for "Crown Heights Anthem" —
+eliminating the duplication risk structurally rather than relying on
+ORM-version-specific deduplication. Confirmed the existing pytest suite
+still passes (5/5). Also checked that tags still display correctly in the
+search response (`["rap", "hip-hop", "boom bap"]`), confirming they load
+correctly through the separate `Song.tags` relationship and the join was
+truly unnecessary for that purpose.
+
 ### Issue #4: Missing rating notification
 
 **How I reproduced it:** Checked `nova`'s notification count via
@@ -210,8 +265,6 @@ ordered list is returned. Verified against all 3 seeded playlists
 `get_playlist()` and `get_user_playlists()` in the same file; neither touches
 the songs list or reuses `get_playlist_songs()`, so they were unaffected by
 both the bug and the fix.
-
-<!-- TODO: Add entries for Issues #4, #1, #2, #3 as we fix them. -->
 
 ## Regression Test
 
