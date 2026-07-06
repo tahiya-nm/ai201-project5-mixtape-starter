@@ -371,5 +371,4 @@ regression of this notification logic.
 
 ## Commit History
 
-<!-- TODO: Paste screenshot of `git log --oneline` on bugfix/mixtape here
-once all fixes are committed. -->
+<img width="935" height="134" alt="Screenshot 2026-07-05 at 10 22 56 PM" src="https://github.com/user-attachments/assets/4d2941ac-537b-47de-a2f4-022fae67d96e" />
