@@ -2,18 +2,60 @@
 
 ## AI Usage
 
-<!-- TODO: Fill this in as we go, and finalize in Milestone 4.
-Describe specific instances of AI use during navigation/debugging —
-what you asked, what it helped you understand, and at least one place
-where you verified or corrected something yourself. So far:
-- Used AI to help build the initial codebase map from app.py, models.py,
-  routes/, and services/ before touching any bug.
-- Used AI to identify which files were relevant to each of the 5 issues
-  and to point out specific lines worth investigating, but verified every
-  root cause myself by reading the code and reproducing the bug against
-  the running app (e.g. for Issue #5, confirmed the [:-1] slice was the
-  cause by reading get_playlist_songs() directly and re-testing after
-  the fix). -->
+I used Claude throughout this project for codebase navigation, tracing root
+causes, and structuring my documentation — but every fix and every claim in
+this submission was verified by me against the actual running app or test
+suite before I accepted it.
+
+**Navigation and codebase mapping:** Used AI to read through app.py,
+models.py, routes/, and services/ and build an initial map of what each file
+does and how the data flows for two features (rating a song, adding a song
+to a playlist). I used this as a starting point but confirmed the structure
+myself by reading the actual files.
+
+**Locating likely root causes:** For all 5 issues, AI pointed me to specific
+functions and lines worth investigating (e.g., the `[:-1]` slice in
+`get_playlist_songs()`, the `.weekday() != 6` condition in
+`update_listening_streak()`). In every case, I verified the actual behavior
+myself — reproducing the bug against the running server or a Flask shell
+before accepting any explanation, and re-testing after each fix.
+
+**Where AI's first theory was wrong and I had to correct it:** For Issue #3
+(duplicate search results), AI's initial theory was that the `outerjoin`
+against `song_tags` would produce duplicate rows via the ORM. When I tested
+this directly, it didn't reproduce — `search_songs()` returned only 1 result
+for a 3-tag song, not 3. Rather than accept that, I ran the project's own
+test suite (which had a test with a comment literally saying "bug causes it
+to be 3") and then wrote diagnostic scripts to compare the raw SQL result
+against the ORM's `.all()` result. That showed the raw SQL genuinely
+returned 3 duplicate rows, but SQLAlchemy 2.0.51's legacy `Query.all()` was
+silently deduplicating them — a version-specific behavior not guaranteed by
+the `sqlalchemy>=2.0.0` constraint in requirements.txt. This was the most
+involved investigation of the project and the AI's first hypothesis needed
+real correction based on empirical testing, not just re-reading the code.
+
+**A verification catch on my own fix:** After fixing and committing Issue #1
+(streak logic), I later discovered via `git log --oneline -- services/
+streak_service.py` that the fix commit never actually touched the file — the
+Sunday bug was still present on disk despite having "passed" earlier manual
+testing in a Flask shell session that had since ended. I caught this by
+re-running the full test suite (`pytest tests/`) before finalizing, saw
+`test_streak_increments_on_sunday` fail unexpectedly, traced it back with
+`git log` and `git status`, reapplied the fix, and reverified with the test
+suite (not just manual shell testing) before recommitting. This is why I
+relied on the automated test suite as a final check rather than trusting
+that a previously-verified manual test meant the fix was actually saved and
+committed.
+
+**Regression test:** For the stretch regression test, I initially considered
+reusing tests that shipped with the starter repo (`test_playlists.py` and
+`test_streaks.py` both already contained bug-specific tests with comments
+revealing the intended bug). I chose instead to write a new test file,
+`tests/test_notifications.py`, covering Issue #4, since no test file existed
+for notification logic at all. I verified it was a genuine regression test
+(not just a test that happens to pass) by temporarily commenting out my fix
+in `rate_song()`, confirming the test failed (`assert 0 == 1`), then
+restoring the fix and confirming it passed again.
 
 ## Codebase Map
 
@@ -104,6 +146,48 @@ adding it to a playlist) are handled in the *same* service file
 through on the notification step.
 
 ## Root Cause Analysis
+
+### Issue #1: Listening streak keeps resetting
+
+**How I reproduced it:** Since this bug is date-dependent, I controlled the
+date directly in a Flask shell rather than relying on the actual current
+date. Computed the most recent Sunday relative to today, set nova's
+`last_listened_at` to the day before that Sunday (Saturday — a genuine
+1-day gap), then called `update_listening_streak(nova, sunday)` directly with
+her starting streak at 5. Expected the streak to increment to 6 (consecutive
+day), but it reset to 1 instead.
+
+**How I found the root cause:** Opened `services/streak_service.py` and read
+the `elif` branch responsible for incrementing the streak:
+`elif days_since_last == 1 and today.weekday() != 6:`. The `and` clause stood
+out immediately, since streak continuation should only depend on how many
+days passed, not on which day of the week it is. Confirmed via Python that
+`.weekday()` returns 0 for Monday through 6 for Sunday, meaning
+`!= 6` translates to "as long as today isn't Sunday."
+
+**The root cause:** The increment condition requires both `days_since_last
+== 1` AND `today.weekday() != 6`. On any Sunday, `today.weekday() != 6`
+evaluates to `False`, so even when a user listened on truly consecutive days
+(Saturday then Sunday), the `elif` fails and execution falls through to the
+`else` branch, which unconditionally resets the streak to 1. This happens
+every single week without exception, on every account, whenever the second
+consecutive listening day happens to fall on a Sunday — matching the "keeps
+resetting" bug report exactly. There's no legitimate reason day-of-week
+should factor into whether a streak continues.
+
+**My fix and side-effect check:** Removed the `and today.weekday() != 6`
+condition, leaving `elif days_since_last == 1:` to increment based solely on
+the day gap. Verified on both sides of the boundary condition: (1) a
+Saturday→Sunday consecutive day now correctly increments 5 → 6; (2) a
+Monday consecutive day (non-Sunday case) still increments 5 → 6 as before,
+confirming the fix didn't disturb the working path; (3) a genuine 3-day gap
+landing on a Sunday still correctly resets the streak to 1, confirming the
+fix didn't overcorrect into "Sundays always increment regardless of gap";
+(4) same-day listening still leaves the streak unchanged at 5, confirming the
+no-op branch was untouched. I later caught, via a full pytest run, that my
+first commit for this fix never actually saved the code change (see AI Usage
+section) — reapplied the fix and reverified with the automated
+`test_streak_increments_on_sunday` test before recommitting.
 
 ### Issue #2: Friends Listening Now shows people from yesterday
 
@@ -268,9 +352,22 @@ both the bug and the fix.
 
 ## Regression Test
 
-<!-- TODO: Write after all required fixes are done — reference the test
-file and explain what behavior it verifies and why it would have failed
-against the buggy code. -->
+Added `tests/test_notifications.py`, a new test file (no equivalent existed
+in the starter repo for notification logic). The key test,
+`test_rating_notifies_the_sharer`, rates a song shared by a different user
+and asserts that exactly one `Notification` record is created for the
+original sharer with `notification_type == "song_rated"`. A second test,
+`test_self_rating_does_not_notify`, confirms rating your own song does not
+create a notification.
+
+I verified this is a genuine regression test, not just a test that happens
+to pass: I temporarily commented out the notification block I added to
+`rate_song()` (reverting to the original buggy behavior) and reran the test
+— it failed with `assert 0 == 1`, confirming the sharer received zero
+notifications under the buggy code, exactly matching Issue #4's reported
+behavior. Restoring the fix made the test pass again. This test now runs as
+part of the full suite (`pytest tests/`) and will catch any future
+regression of this notification logic.
 
 ## Commit History
 
