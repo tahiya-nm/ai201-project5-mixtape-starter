@@ -105,6 +105,44 @@ through on the notification step.
 
 ## Root Cause Analysis
 
+### Issue #2: Friends Listening Now shows people from yesterday
+
+**How I reproduced it:** Hit `GET /feed/<nova_id>/listening-now` initially and
+got an empty feed, since the original seed data's "recent" events (10-20 min
+old at seed time) had aged out entirely by the time I tested. To get a
+controlled reproduction, I used a Flask shell to manually insert a
+`ListeningEvent` for darius (nova's friend) with `listened_at` set to exactly
+2 hours before now. Re-querying the "listening now" endpoint showed darius in
+the results with that 2-hour-old event — a feed meant to show who's
+*currently* listening was showing someone from 2 hours ago.
+
+**How I found the root cause:** Opened `services/feed_service.py` and read
+`get_friends_listening_now()`. The query logic itself was correct — it
+filters `ListeningEvent.listened_at >= cutoff` and dedupes to the most recent
+event per friend. The problem was in how `cutoff` gets computed: it's
+`datetime.now(timezone.utc) - RECENT_THRESHOLD`, and `RECENT_THRESHOLD` is
+defined as a module-level constant at the top of the file.
+
+**The root cause:** `RECENT_THRESHOLD = timedelta(hours=24)`. A 24-hour
+window is far too generous for a feed called "listening now" — anyone who
+listened to anything at any point in the last full day passes the filter and
+is shown as if they're currently listening. This isn't a comparison bug or an
+off-by-one; the threshold value itself was simply set to represent "today"
+rather than "right now." The seed data's own comments support a much shorter
+intended window — recent test events were seeded only 10–20 minutes old,
+implying the feature was designed around a much tighter recency window than
+what the constant enforced.
+
+**My fix and side-effect check:** Changed `RECENT_THRESHOLD` from
+`timedelta(hours=24)` to `timedelta(minutes=30)`. Verified: (1) the 2-hour-old
+darius event now correctly disappears from "listening now" (count 1 → 0);
+(2) a newly-added 10-minute-old event for darius correctly appears (count 0 →
+1); (3) checked `get_activity_feed()` in the same file, which intentionally
+has no time filter at all — confirmed it still returns the full history (10
+events, including both the 2-hour-old and 10-minute-old ones), proving the
+`RECENT_THRESHOLD` change is isolated to `get_friends_listening_now()` and
+doesn't affect the unrelated activity feed function.
+
 ### Issue #4: Missing rating notification
 
 **How I reproduced it:** Checked `nova`'s notification count via
