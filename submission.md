@@ -105,6 +105,43 @@ through on the notification step.
 
 ## Root Cause Analysis
 
+### Issue #4: Missing rating notification
+
+**How I reproduced it:** Checked `nova`'s notification count via
+`GET /users/<nova_id>/notifications` (baseline: 1, from a seeded
+playlist-add notification). Had `darius` rate one of nova's shared songs via
+`POST /songs/<song_id>/rate`. The rating was saved successfully (returned a
+valid `Rating` object), but re-checking nova's notifications afterward still
+showed count 1 — no new notification was created.
+
+**How I found the root cause:** Opened `services/notification_service.py`
+and compared `add_to_playlist()` against `rate_song()`, since both represent
+a friend interacting with a song someone else shared, and only one of them
+was working. `add_to_playlist()` ends with a check
+(`if song.shared_by != added_by_user_id:`) that calls `create_notification()`
+to alert the original sharer. `rate_song()` performs the equivalent save
+(update or create the `Rating`, then commit) but has no corresponding
+notify step — it just returns after the commit.
+
+**The root cause:** The notification step for ratings was never implemented.
+This isn't a wrong condition or a typo — `rate_song()` is simply missing the
+entire "notify the sharer" block that `add_to_playlist()` has. Structurally
+the two functions do the same kind of thing (a friend acts on a shared song,
+the sharer should be told), but only the playlist path was built out fully.
+
+**My fix and side-effect check:** Added a notification block to `rate_song()`,
+placed after the commit and modeled directly on the pattern in
+`add_to_playlist()`: if `song.shared_by != user_id`, call
+`create_notification()` with a `song_rated` type and a message including the
+rater's username, song title, and score. Verified: (1) darius rating nova's
+song now correctly produces a `song_rated` notification for nova
+(count 1 → 2); (2) nova rating her own song does NOT produce a notification
+(count stayed at 2), confirming the self-notification guard works the same
+way it does in `add_to_playlist()`; (3) darius re-rating the same song
+produces a second `song_rated` notification (count 2 → 3) — each rating
+interaction generates its own notification, consistent with how
+`add_to_playlist` behaves on repeated calls.
+
 ### Issue #5: Last playlist song never shows
 
 **How I reproduced it:** Queried `Playlist.query.all()` and a helper count
